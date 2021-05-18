@@ -1,9 +1,7 @@
 #ifndef VK_API_H
 #define VK_API_H
 
-#include <string>
 #include <unordered_map>
-#include <vector>
 
 #include "json.hpp"
 
