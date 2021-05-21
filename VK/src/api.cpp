@@ -1,6 +1,7 @@
 #include <curl/curl.h>
 #include "api.h"
 
+
 using ::std::string;
 using json = ::nlohmann::json;
 
@@ -33,7 +34,8 @@ bool VK::Client::oauth(const callback_func_cap handler) {
 
     auto it = blank.find("=");
     if(it == string::npos) {
-        return false;
+        this->a_t = blank;
+    	return !this->a_t.empty();
     }
     it++;
     this->a_t = blank.substr(it);
