@@ -1,134 +1,106 @@
 #include "VkScriptCore.h"
 
+std::vector<nlohmann::json> vkscript::VkScriptCore::access_tokens;
+std::string vkscript::VkScriptCore::authorize_uri;
 std::string vkscript::VkScriptCore::token_link;
 std::stringstream vkscript::VkScriptCore::log;
-bool vkscript::VkScriptCore::reset_token;
+std::string vkscript::VkScriptCore::preselect_token;
 
 vkscript::VkScriptCore::VkScriptCore() : api("5.21")
 {
+	ztime = std::chrono::system_clock::now();
 	addLog("VkScriptCore created.");
-	searching = false;
+	api.oauth(nullOauth);
 }
 
-void vkscript::VkScriptCore::auth()
+std::string vkscript::VkScriptCore::nullOauth(const std::string& link)
 {
+	authorize_uri = link;
+	return {};
+}
+
+int vkscript::VkScriptCore::auth(const std::string& preselect)
+{
+	preselect_token = preselect;
 	if (api.oauth(setAccessToken)) {
 		access_token = api.access_token();
-		token_installed = true;
+		token_installed = checkAccess();
+		return 0;
 	}
-	else
-	{
-		token_installed = false;
-		addLog("Failed to set token", VK_ERROR);
-	}
+	token_installed = false;
+	addLog("Failed to set token", VK_ERROR);
+	return 1;
 }
 
-void vkscript::VkScriptCore::reauth()
+void vkscript::VkScriptCore::readUserInfo()
 {
-	reset_token = true;
-	auth();
-
-	reset_token = false;
-}
-
-void vkscript::VkScriptCore::start()
-{
-	genIds();
-	startSearching();
-}
-
-void vkscript::VkScriptCore::stop()
-{
-	searching = false;
-	saveInterruptedSearch(current_id);
-}
-
-void vkscript::VkScriptCore::startSearching()
-{
-	addLog("Start searching...");
+	// Mandatory user information
+	user_info["User info"]["Username"] = user_name;
+	user_info["User info"]["User ID"] = user_id;
 	
-	percent = 0;
-	searching = true;
-	const double end = end_point;
-	double interval;
-	old_start == 0 ? interval = start_point - end_point : interval = old_start - end_point;
-	while (searching)
+	const std::string filename = "results/" + getFilename() + ".txt";
+	std::ifstream read_inf(filename, std::ios::in);
+	if (read_inf.is_open())
 	{
-		for (auto a : id_arrays)
+		std::string inf;
+		for (std::string str; std::getline(read_inf, str);)
 		{
-			last_checked_id = a.back();
-			current_id = a.front();
-			
-			std::string params = idToString(a);
-
-			auto clk_st = std::chrono::high_resolution_clock::now();
-			VK::json data = api.call("docs.getById", params);
-
-			auto clk_end = std::chrono::high_resolution_clock::now();
-
-			auto elapsed_time = std::chrono::duration_cast<std::chrono::milliseconds>(clk_end - clk_st).count();
-			if (elapsed_time < TIME_RQ)
-			{
-				std::this_thread::sleep_for(std::chrono::milliseconds(TIME_RQ - elapsed_time));
-			}
-			
-			double progress = 100 - round(((last_checked_id - end) / interval) * 100.0);
-
-			data["interval"] =  std::to_string(current_id) + "-" + std::to_string(last_checked_id);
-
-			if (data["error"].empty()) {
-				if (!data["response"].empty()) {
-					result += formatData(data, VK_EXTENDED);
-					addLog("Something was found.", VK_SPECIAL);
-				}
-			}
-			else
-			{
-				std::string error = formatData(data, VK_ERROR);
-				addLog(error, VK_ERROR);
-				
-				saveInterruptedSearch(current_id);
-				break;
-			}
-			if (progress == 100) progress = 99;
-			if (percent < progress)
-				std::cout << progress << "%" << std::endl;
-			last_checked_id != end_point ? percent = progress : percent = 100;  // Rounding correction
+			inf += str;
+			if (std::count(inf.begin(), inf.end(), '}') >= 2) { while (inf[inf.size() - 1] != '}') { inf.pop_back(); } break; }
 		}
-		searching = false;
+		if (inf.empty() || inf.find("User info") == std::string::npos)
+		{
+			
+			addLog("User info not found in a file. It will be created after the operation is complete.", VK_WARNING);
+		}
+		else {
+			// Write the read information from the file
+			try { user_info = nlohmann::ordered_json::parse(inf); }
+			catch(...) {addLog("Reading user information from a file caused an error.", VK_WARNING); }
+			try { readOtherUserInfo(); }
+			catch (...) {
+				addLog("Additional user information not found in a file. It will be created after the operation is complete.", VK_WARNING);
+			}
+		}
+		read_inf.close();
 	}
-	addLog("Search completed.");
-	searching = false;
 }
-
-bool vkscript::VkScriptCore::checkTokenFile()
+bool vkscript::VkScriptCore::readTokenFile()
 {
-	if (reset_token) return false;
-	std::string temp;
-	std::ifstream read_token("token", std::ios_base::app);
-	if (read_token.is_open()) {
-		read_token >> temp;
+	std::ifstream read_token("tokens", std::ios::in);
+	if (read_token.is_open())
+	{
+		for (std::string line; std::getline(read_token, line); )
+		{
+			nlohmann::json jt = nlohmann::json::parse(line);
+			access_tokens.emplace_back(jt);
+		}
 		read_token.close();
+		addLog("File contains " + std::to_string(access_tokens.size()) + " access tokens.");
 	}
-	if (!temp.empty()) {
-		token_link = temp;
-		addLog("Token found in file.");
+	if (access_tokens.size()>1)
+	{
+		chooseToken();
+	}
+	if (!access_tokens.empty()) {
+		token_link = access_tokens[0]["token"].get<std::string>();
 		return true; // token already installed
 	}
 	return false;
 }
+
 // Callback function for install a token
 std::string vkscript::VkScriptCore::setAccessToken(const std::string& link)
 {
+	authorize_uri = link;
 	std::string res;
-	if (!checkTokenFile()) {
+	if (!readTokenFile()) {
 		std::string com = "start \"\" ";
 		com += "\"" + link + "\"";
 		system(com.c_str());
 		// Link sends to the get the token page
 		std::cout << link << std::endl;
-		std::cin >> res;
-		saveToken(res);
+		res = addToken();
 	}
 	else {
 		res = token_link;
@@ -136,247 +108,150 @@ std::string vkscript::VkScriptCore::setAccessToken(const std::string& link)
 	return res;
 }
 
-void vkscript::VkScriptCore::saveToken(std::string link)
+std::string vkscript::VkScriptCore::addToken()
 {
-	std::ofstream write_token("token");
+	std::string n;
+	std::string t;
+	std::cout << "Enter a token name: ";
+	getline(std::cin, n);
+	
+	std::cout << authorize_uri << std::endl;
+	
+	std::cout << "\nEnter a token link: ";
+	getline(std::cin, t);
+
+	saveToken(n, t);
+	return t;
+}
+
+void vkscript::VkScriptCore::saveToken(std::string name, std::string link)
+{
+	nlohmann::json token{};
+	token["name"] = name;
+	token["token"] = link;
+
+	std::ofstream write_token("tokens", std::ios::app);
 	if (write_token.is_open())
 	{
-		write_token << link;
+		write_token << token << "\n";
 		write_token.close();
-
-		addLog("Token saved.");
+		addLog({ "Token \"" + name + "\"has been saved." });
 	}
 }
 
-std::string vkscript::VkScriptCore::formatData(nlohmann::json& data, int mode)
+void vkscript::VkScriptCore::chooseToken()
 {
-	std::string fdata;
-	if (mode == VK_NORMAL)
+	// Jacquard coefficient just for fun
+	if (!preselect_token.empty())
 	{
-		nlohmann::basic_json<> inf = data["response"][0];
-		fdata += "{\nTitle: " + inf["title"].get<std::string>() + "\n"
-			+ "Date: " + getDate(inf["date"].get<unsigned long long>()) + "\n"
-			+ "URL: " + inf["url"].get<std::string>() + "\n"
-			+ "Interval: " + data["interval"].get<std::string>() + "\n"
-			+ "}\n";
-	}
-	else if (mode == VK_ERROR)
-	{
-		nlohmann::basic_json<> err = data["error"];
-		fdata += "(" + data["interval"].get<std::string>() + ") "
-			+ "Error code: "
-			+ err["error_code"].dump() + ". " // Warning! Is not a string
-			+ err["error_msg"].get<std::string>();
-	}
-	else if (mode == VK_EXTENDED)
-	{
-		nlohmann::basic_json<> inf = data["response"][0];
-		fdata +="{\nTitle: " + inf["title"].get<std::string>() + "\n"
-			+ "Owner ID: " + inf["owner_id"].dump() + "\n"
-			+ "ID: " + inf["id"].dump() + "\n"
-			+ "Date: " + getDate(inf["date"].get<unsigned long long>()) + "\n"
-			+ "Type: " + inf["ext"].get<std::string>() + "\n"
-			+ "Size: " + inf["size"].dump() + "byte" + "\n"
-			+ "URL: " + inf["url"].get<std::string>() + "\n"
-			+ "Interval: " + data["interval"].get<std::string>() + "\n"
-			+ "}\n";
-	}
-	return fdata;
-}
-
-std::string vkscript::VkScriptCore::idToString(std::vector<long long> a) const
-{
-	std::string ids = "docs=";
-	const std::string ui= std::to_string(user_id);
-	for (auto id : a)
-	{
-		ids += ui + "_" + std::to_string(id)+ ",";
-	}
-	ids.pop_back();
-	return ids;
-}
-
-void vkscript::VkScriptCore::genIds()
-{
-	addLog("Creating an array of search IDs...");
-	if (start_point >= end_point)
-	{
-		const unsigned long long search_interval = start_point - end_point;
-		const int size_of_one_request = _SIZE_OF_ONE_REQUEST;
-
-		auto current_id = start_point;
-		unsigned int i = static_cast<unsigned int>(ceil(static_cast<double>(search_interval) / static_cast<double>(size_of_one_request)));
-		for (; i > 0; i--)
+		double k = 0.0;
+		size_t choice = 0;
+		for (size_t i = 0; i < access_tokens.size(); i++)
 		{
-			std::vector<long long> id_set;
-			for (int j = size_of_one_request; j > 0; j--, current_id--)
-			{
-				if (current_id >= end_point)
-					id_set.emplace_back(current_id);
-			}
-			id_arrays.push_back(id_set);
+			double tk = simple_jaccard(preselect_token, access_tokens[i]["name"].get<std::string>());
+			if (k < tk) { k = tk; choice = i; }
 		}
-		addLog("Array creation completed successfully.");
+		std::swap(access_tokens[choice], access_tokens.front());
+		addLog({ "Selected token - " + access_tokens[0]["name"].get<std::string>() });
+		return;
 	}
-	else {
-		addLog("Wrong search interval.", VK_ERROR);
-		exit(0);
-	}
-
-}
-
-void vkscript::VkScriptCore::saveInterruptedSearch(unsigned long long breakpoint)
-{
-	nlohmann::json bkp{};
-	old_start != 0 ? bkp["start_point"] = old_start : bkp["start_point"] = start_point;
-	bkp["end_point"] = end_point;
-	bkp["user_id"] = user_id;
-	bkp["breakpoint"] = breakpoint;
 	
-	std::string filename = "backups//" + std::to_string(user_id) + ".json";
-	
-	std::ofstream outdata(filename, std::ios::trunc);
-	if (outdata.is_open())
-	{
-		outdata << bkp;
-		outdata.close();
-		addLog("Search recovery data has been saved in json file.");
+	size_t choice = 1;
+	for (size_t i = 0; i < access_tokens.size(); i++)
+	{ std::cout << "[" << i + 1 << "] " << access_tokens[i]["name"].get<std::string>() << std::endl; }
+	// Checking the correctness of the input
+	bool icorrect = false;
+	while (!icorrect) {
+		std::cout << "Select the number of the required token: ";
+		if (!(std::cin >> choice))
+		{
+			std::cin.clear();
+			std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+		}
+		else --choice <= access_tokens.size() ? icorrect = true : icorrect = false;
 	}
-	else
-	{
-		addLog("Search recovery data is not saved.", VK_WARNING);
-	}
+	std::swap(access_tokens[choice], access_tokens.front());
+	addLog({ "Selected token - " + access_tokens[0]["name"].get<std::string>() });
 }
 
-void vkscript::VkScriptCore::saveResult()
+bool vkscript::VkScriptCore::setUser(const std::string &id) 
 {
-	std::string filename = "results//" + std::to_string(user_id) + ".txt";
-	
-	std::ofstream outdata(filename, std::ios::app);
-	if (outdata.is_open())
+	std::string strid = id;
+	if (strid.find_first_not_of("0123456789") == std::string::npos) // Input consists only of numbers
 	{
-		outdata << result;
-		outdata.close();
-		addLog({ "Result has been saved in " + filename });
+		strid.insert(0,"id");
 	}
-}
-
-void vkscript::VkScriptCore::loadBackup(const char* path)
-{
-	std::stringstream save_data;
-	std::ifstream bkp(path, std::ios_base::in);
-	if (bkp.is_open())
+	if (strid.find_first_of('/') != std::string::npos)
 	{
-		save_data << bkp.rdbuf();
-		bkp.close();
+		if (strid[strid.size() - 1] == '/') strid.pop_back();
+		auto sl = strid.find_last_of('/') + 1;
+		strid.erase(strid.begin(), strid.begin() + sl);
 	}
-	nlohmann::json j = nlohmann::json::parse(save_data);
-	old_start = j["start_point"].get<unsigned long long>();
-	end_point = j["end_point"].get<unsigned long long>();
-	user_id = j["user_id"].get<unsigned long long>();
-	start_point = j["breakpoint"].get<unsigned long long>();
-	addLog("Backup has been loaded.");
-}
-
-void vkscript::VkScriptCore::setStartPoint(long long n)
-{
-	start_point = n;
-	addLog({ "Start point " + std::to_string(n) + " is set." });
-}
-
-void vkscript::VkScriptCore::setEndPoint(long long n)
-{
-	end_point = n;
-	addLog({ "End point " + std::to_string(n) + " is set." });
-}
-
-bool vkscript::VkScriptCore::setUserId(const std::string &id) 
-{
-	if (id.find_first_not_of("0123456789") == std::string::npos) // Input consists only of numbers
-	{
-		user_id = stoi(id);
-		addLog("User ID has been installed.");
-		return true;
-	}
-	if (id.find_first_of('/') != std::string::npos)
-	{
-		std::string c_id = id;
-		if (c_id[c_id.size() - 1] == '/') c_id.pop_back();
-		auto sl = c_id.find_last_of('/') + 1;
-		c_id.erase(c_id.begin(), c_id.begin() + sl);
-
-		VK::params_map p = { {"q", c_id},
+	VK::params_map p = { {"q", strid},
 			{"count","1"},
 		};
-
-		VK::json data = api.call("users.search", p);
-		try
-		{
-			user_id = data["response"]["items"][0]["id"].get<unsigned long long>();
-			// User [First Last] : id1234567890 has been found.
-			user_name = data["response"]["items"][0]["first_name"].get<std::string>() + " " + data["response"]["items"][0]["last_name"].get<std::string>();
-			addLog({"User ["
-				+ user_name
-				+ "] : id" + std::to_string(data["response"]["items"][0]["id"].get<unsigned long long>())
-				+ " has been found." });
-			return true;
-		}
-		catch (...)
-		{
-			user_id = NULL;
-			
-			addLog("User not found", VK_WARNING);
-			return false;
-		}
-	}
-	else
+	VK::json data = sendRequest("users.search", p);
+	if (!data["error"].empty())
 	{
-		VK::params_map p = { {"q", id},
-			   {"count","1"},
-		};
-		VK::json data = api.call("users.search", p);
-		try
-		{
-			user_id = data["response"]["items"][0]["id"].get<unsigned long long>();
-			// User [First Last] : id1234567890 has been found.
-			user_name = data["response"]["items"][0]["first_name"].get<std::string>() + " " + data["response"]["items"][0]["last_name"].get<std::string>();
-			addLog({ "User ["
+		addLog(formatData(data, VK_ERROR),VK_ERROR);
+	}
+	try
+	{
+		user_id = data["response"]["items"][0]["id"].get<unsigned long long>();
+		// User [First Last] : id1234567890 has been found.
+		user_name = data["response"]["items"][0]["first_name"].get<std::string>() + " " + data["response"]["items"][0]["last_name"].get<std::string>();
+		setFilename();
+		addLog({ "User ["
 				+ user_name
 				+ "] : id" + std::to_string(data["response"]["items"][0]["id"].get<unsigned long long>())
 				+ " has been found." });
-			return true;
-		}
-		catch (...)
-		{
-			addLog("User not found", VK_WARNING);
-			return false;
-		}
+		readUserInfo();
+		
+		is_user_found = true;
+		return true;
 	}
+	catch (...) {}
+	user_id = NULL;
+	addLog("User not found", VK_WARNING);
+	is_user_found = false;
+	return false;
 }
 
-nlohmann::json vkscript::VkScriptCore::getResult() const
+nlohmann::json vkscript::VkScriptCore::sendRequest(const std::string& method, const std::string& params)
 {
-	return result;
+	last_request_time = std::chrono::high_resolution_clock::now();
+	nlohmann::json data = api.call(method, params);
+	std::chrono::steady_clock::time_point waitResponse = std::chrono::high_resolution_clock::now();
+	// VK can only respond to 3 requests per second
+	const long long elapsed_time = std::chrono::duration_cast<std::chrono::milliseconds>(waitResponse - last_request_time).count();
+	if (elapsed_time < 1000 / 3)
+	{
+		std::this_thread::sleep_for(std::chrono::milliseconds(1000 / 3 - elapsed_time));
+	}
+	return data;
 }
-
-double vkscript::VkScriptCore::getPercent() const
+nlohmann::json vkscript::VkScriptCore::sendRequest(const std::string& method, const VK::params_map& params)
 {
-	return percent;
+	last_request_time = std::chrono::high_resolution_clock::now();
+	nlohmann::json data = api.call(method, params);
+	std::chrono::steady_clock::time_point waitResponse = std::chrono::high_resolution_clock::now();
+	// VK can only respond to 3 requests per second
+	const long long elapsed_time = std::chrono::duration_cast<std::chrono::milliseconds>(waitResponse - last_request_time).count();
+	if (elapsed_time < 1000 / 3)
+	{
+		std::this_thread::sleep_for(std::chrono::milliseconds(1000 / 3 - elapsed_time));
+	}
+	return data;
 }
 
-unsigned long long vkscript::VkScriptCore::getUserId() const
+ull vkscript::VkScriptCore::getUserId() const
 {
 	return user_id;
 }
 
-bool vkscript::VkScriptCore::getSearchStatus() const
-{
-	return searching;
-}
-
 bool vkscript::VkScriptCore::getTokenStatus()
 {
-	if (checkTokenFile())
+	if (readTokenFile())
 	{
 		token_installed = true;
 	}
@@ -384,10 +259,21 @@ bool vkscript::VkScriptCore::getTokenStatus()
 	return token_installed;
 }
 
-std::string vkscript::VkScriptCore::getProgramTime() const
+void vkscript::VkScriptCore::clear()
 {
-	clock_t t = clock();
-	return std::to_string(t / CLOCKS_PER_SEC);
+	api.clear();
+	token_link.clear();
+	access_tokens.clear();
+	authorize_uri.clear();
+	access_token.clear();
+	preselect_token.clear();
+	user_name.clear();
+	user_info.clear();
+	old_start = 0;
+	start_point = 0;
+	end_point = 0;
+	user_id = 0;
+	c_clear();
 }
 
 std::string vkscript::VkScriptCore::getAccessToken() const
@@ -412,13 +298,24 @@ void vkscript::VkScriptCore::saveLog()
 	}
 }
 
+bool vkscript::VkScriptCore::checkAccess()
+{
+	nlohmann::json jres = sendRequest("users.get");
+	if (jres.find("error") != jres.end()) {
+		addLog("Invalid access token. Try authentication again.", VK_ERROR);
+		return false;
+	}
+	addLog("Access token is valid.");
+	return true;
+}
+
 void vkscript::VkScriptCore::addLog(std::string str, int logtype)
 {
 	std::string lgt;
 	if (logtype == VK_NORMAL) lgt = "[INFO] ";
 	if (logtype == VK_ERROR) lgt = "[ERROR] ";
 	if (logtype == VK_WARNING) lgt = "[WARNING] ";
-	if (logtype == VK_SPECIAL) lgt = "[FOUND] ";
+	if (logtype == VK_SPECIAL) lgt = "[!] ";
 	
 	log << "[" << getDate() << "] " << lgt << str << std::endl;
 #ifdef CONSOLE_LOG
@@ -431,23 +328,23 @@ void vkscript::VkScriptCore::addLog(std::string str, int logtype)
 
 vkscript::VkScriptCore::~VkScriptCore()
 {
-	addLog({"VkScriptCore finished in " + getProgramTime() + " seconds."});
-#ifdef _LOGS
-	saveLog();
+	try { addLog({ "VkScriptCore finished in " + getElapsedTime(ztime) + '.' }); }catch (...){}
+#ifdef VKS_LOGS
+	try { saveLog(); } catch (...){}
 #endif
 }
 
 std::string vkscript::getDate()
 {
 	char date[80];
-	time_t seconds = time(NULL);
+	time_t seconds = time(nullptr);
 	struct tm timeinfo;
 	localtime_s(&timeinfo, &seconds);
 	const char* format = "%d.%m.%y %H:%M:%S";
 	strftime(date, 80, format, &timeinfo);
 	return date;
 }
-std::string vkscript::getDate(unsigned long long unixtime)
+std::string vkscript::getDate(ull unixtime)
 {
 	char date[80];
 	time_t seconds(unixtime);
@@ -456,4 +353,66 @@ std::string vkscript::getDate(unsigned long long unixtime)
 	const char* format = "%d %b %Y %H:%M:%S";
 	strftime(date, 80, format, &timeinfo);
 	return  date;
+}
+
+std::string vkscript::cleanString(const std::string& str)
+{
+	std::string clstring = str;
+	clstring.erase(std::remove_if(clstring.begin(), clstring.end(), [](char& c)
+		{
+			std::string a = "abcdefghijklmnopqrstuvwxyz ";
+			if (a.find(std::tolower(c)) == std::string::npos)
+			{
+				return true;
+			}
+			if (c == ' ')
+			{
+				c = '_';
+			}
+			c = std::tolower(c);
+			return false;
+		}), clstring.end());
+	return clstring;
+}
+
+std::string vkscript::getElapsedTime(std::chrono::system_clock::time_point t0)
+{
+	const auto t = std::chrono::system_clock::now();
+	const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(t - t0).count();
+	
+	std::string hh = "00", mm = "00" , ss;
+	
+	long long h = seconds / 3600;
+	hh = std::to_string(h);
+	
+	long long m = (seconds - h * 3600) / 60;
+	mm = std::to_string(m);
+	
+	long long s = seconds - h * 3600 - m * 60;
+	ss = std::to_string(s);
+	
+	if (hh.size() < 2) hh.insert(0, 1, '0');
+	mm.insert(0, 2 - mm.size(), '0');
+	ss.insert(0, 2 - ss.size(), '0');
+	
+	return { hh + ':' + mm + ':' + ss };
+}
+
+double vkscript::simple_jaccard(const std::string& first_str, const std::string& second_str)
+{
+	std::string temp_f = first_str, temp_s = second_str;
+	std::transform(temp_f.begin(), temp_f.end(), temp_f.begin(), [](unsigned char c) { return std::tolower(c); });
+	std::transform(temp_s.begin(), temp_s.end(), temp_s.begin(), [](unsigned char c) { return std::tolower(c); });
+	double a = temp_f.length();
+	double b = temp_s.length();
+	double c = 0;
+	for (auto ch : temp_f) {
+		auto ff = temp_s.find(ch);
+		if (ff != std::string::npos)
+		{
+			temp_s.erase(temp_s.begin() + ff, temp_s.begin() + ff + 1);
+			c++;
+		}
+	}
+	return c / (a + b - c);
 }
