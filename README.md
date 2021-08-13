@@ -22,6 +22,7 @@ int main(int argc, char* argv[])
     docScript script;
 
     script.auth(); // Получение токена
+    		   // script.auth("/Имя сохраненного токена"); 
     script.setUser("2314852"); // id пользователя для поиска
     script.setStartPoint(165123055); // Точка начала поиска
     script.setEndPoint(165123050); // Точка конца поиска
